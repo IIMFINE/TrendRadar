@@ -1,6 +1,6 @@
 # coding=utf-8
 """
-评论增强器：对生成完的 HTML 中每条新闻调 Gemini 评论员视角，
+评论增强器：对生成完的 HTML 中每条新闻调 Codex 评论员视角，
 把评论注入回原 HTML，实现"localhost:8090 自动看到带评论版本"。
 
 设计要点：
@@ -44,19 +44,23 @@ def _env_int(name: str, default: int) -> int:
 
 
 ENABLED = _env_bool("COMMENTARY_ENABLED", False)
-MAX_ITEMS = _env_int("COMMENTARY_MAX_ITEMS", 30)
+# MAX_ITEMS: 单轮最多评论多少条。0 = 不限制（抓多少评多少，默认行为）。
+# 想控制成本/耗时可设为正整数，比如 30。
+MAX_ITEMS = _env_int("COMMENTARY_MAX_ITEMS", 0)
 CONCURRENCY = _env_int("COMMENTARY_CONCURRENCY", 4)
 RETRIES = _env_int("COMMENTARY_RETRIES", 3)
-MODEL = os.environ.get("COMMENTARY_MODEL", "gemini-3.1-pro-preview").strip()
-THINKING = os.environ.get("COMMENTARY_THINKING", "LOW").strip().upper()
+MODEL = os.environ.get("COMMENTARY_MODEL", "gpt-5.6-sol").strip()
+THINKING = os.environ.get("COMMENTARY_THINKING", "HIGH").strip().lower()
+# SEARCH: 是否开启模型内置联网搜索。默认开（抓热点强依赖时效性事实）。
 SEARCH = _env_bool("COMMENTARY_SEARCH", True)
 
-GEMINI_BASE = os.environ.get(
-    "GEMINI_BASE_URL",
-    "https://api.aicodemirror.com/api/gemini",
+COMMENTARY_BASE = os.environ.get(
+    "COMMENTARY_BASE_URL",
+    "https://api.aicodemirror.ai/api/codex/backend-api/codex/v1",
 ).rstrip("/")
-GEMINI_KEY = (
-    os.environ.get("GEMINI_API_KEY")
+COMMENTARY_KEY = (
+    os.environ.get("COMMENTARY_API_KEY")
+    or os.environ.get("GEMINI_API_KEY")  # 兼容旧配置，避免升级时直接中断
     or os.environ.get("GOOGLE_API_KEY")
     or ""
 )
@@ -75,70 +79,103 @@ PROMPT_TEMPLATE = """⏰ 重要提示：当前真实日期是 {current_date}，�
 锐评风格要求：
 1) **时间准确**：请务必基于当前真实日期（{current_date}）来判断新闻的时效性，不要根据训练数据中的过时信息做出错误判断。
 2) **开门见山**：第一句话直击要害，点破表象背后的真实动机或利益博弈（不超过30字）。
-3) **犀利剖析**：用 60~100 字深挖本质——这背后是谁得利？谁买单？对普通人/市场/行业格局会产生什么实际冲击？
-4) **有理有据**：优先引用搜索到的最新事实、数据或案例支撑观点；如果信息存疑，直接点名质疑。
-5) **语言风格**：简洁有力，不绕弯子，不打官腔，敢于揭示矛盾和问题。避免中立表述，要有明确态度。
-6) 只输出评论正文，一段连续中文，不要标题、不要 Markdown 符号、不要寒暄。"""
+3) **深层原因分析**：用 80~120 字深挖这条新闻为什么会在此时此刻出现——从政策环境、技术演进、市场周期、社会情绪等多维度剖析根源。避免用"资本布局"、"被资本操纵"等笼统概念替代具体分析，要落实到具体的利益相关方、政策动向、技术节点或市场拐点。
+4) **历史镜像**：结合历史上的今天或近期类似事件，看是否存在周期性规律、重演模式或反常之处（30~50字）。如果搜索不到明确关联，可简略提及行业/领域的历史走向作为对照。
+5) **趋势预判**：基于搜索到的最新信息和当前态势，预测后续最可能出现的 2-3 种走向——哪些群体会进一步行动？政策/市场会如何响应？对普通人有什么实际影响？（40~60字）
+6) **有理有据**：优先引用搜索到的最新事实、数据或案例支撑观点；如果信息存疑，直接点名质疑。
+7) **语言风格**：简洁有力，不绕弯子，不打官腔，敢于揭示矛盾和问题。避免中立表述，要有明确态度。
+8) 只输出评论正文，一段连续中文，不要标题、不要 Markdown 符号、不要寒暄。总字数控制在 150~230 字。"""
 
 
-# === Gemini 原生 grounding 调用 ===
+# === Codex Responses API 调用 ===
 
-def _call_gemini(prompt: str, timeout: int = 120) -> str:
-    """调一次 Gemini generateContent + google_search grounding。返回纯文本。"""
-    if not GEMINI_KEY:
-        raise RuntimeError("missing GEMINI_API_KEY")
+def _extract_response_text(data: dict) -> str:
+    """从 Responses API 响应提取模型正文，并兼容常见代理包装格式。"""
+    output_text = data.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+
+    chunks: list[str] = []
+    for item in data.get("output", []) or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") in ("output_text", "text"):
+                text = content.get("text")
+                if isinstance(text, str):
+                    chunks.append(text)
+    if chunks:
+        return "".join(chunks).strip()
+
+    # Some OpenAI-compatible gateways wrap a Responses result as chat.completions.
+    choices = data.get("choices", []) or []
+    if choices and isinstance(choices[0], dict):
+        message = choices[0].get("message", {}) or {}
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+    return ""
+
+
+def _call_codex(prompt: str, timeout: int = 120) -> str:
+    """调用 Codex Responses API，并按需启用模型内置 web_search。"""
+    if not COMMENTARY_KEY:
+        raise RuntimeError("missing COMMENTARY_API_KEY")
 
     body: dict = {
-        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "thinkingConfig": {
-                "thinkingLevel": THINKING,
-                "includeThoughts": False,
-            }
-        },
+        "model": MODEL,
+        "input": prompt,
     }
+    if THINKING in {"low", "medium", "high"}:
+        body["reasoning"] = {"effort": THINKING}
     if SEARCH:
-        body["tools"] = [{"google_search": {}}]
+        body["tools"] = [{"type": "web_search"}]
 
     req = urllib.request.Request(
-        url=f"{GEMINI_BASE}/v1/models/{MODEL}:generateContent",
+        url=f"{COMMENTARY_BASE}/responses",
         data=json.dumps(body).encode("utf-8"),
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_KEY,
+            "Authorization": f"Bearer {COMMENTARY_KEY}",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    cand = (data.get("candidates") or [{}])[0]
-    parts = cand.get("content", {}).get("parts", [])
-    text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
-    return text.strip()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")[:300]
+        raise RuntimeError(f"responses HTTP {e.code}: {detail}") from e
+    text = _extract_response_text(data)
+    if not text:
+        raise RuntimeError("responses returned no output text")
+    return text
 
 
 def _call_with_retry(prompt: str) -> str:
     last_err = ""
     for attempt in range(1, RETRIES + 1):
         try:
-            text = _call_gemini(prompt)
+            text = _call_codex(prompt)
             if not text:
                 raise RuntimeError("empty response")
             return text
-        except (urllib.error.HTTPError, urllib.error.URLError, RuntimeError, Exception) as e:
+        except Exception as e:
             last_err = str(e)[:200]
             if attempt < RETRIES:
                 delay = 2.0 * (2 ** (attempt - 1))
                 print(f"  [comment retry {attempt}/{RETRIES - 1}] {last_err} → wait {delay}s",
                       file=sys.stderr)
                 time.sleep(delay)
-    raise RuntimeError(f"gemini failed after {RETRIES} attempts: {last_err}")
+    raise RuntimeError(f"Codex failed after {RETRIES} attempts: {last_err}")
 
 
 # === 缓存 ===
 
 def _key_of(source: str, title: str) -> str:
-    h = hashlib.md5(f"{source}||{title}".encode("utf-8")).hexdigest()
+    h = hashlib.md5(f"{MODEL}||{SEARCH}||{source}||{title}".encode("utf-8")).hexdigest()
     return h
 
 
@@ -351,8 +388,8 @@ def enhance_html_with_comments(html_content: str) -> str:
     """
     if not ENABLED:
         return html_content
-    if not GEMINI_KEY:
-        print("[commentary] COMMENTARY_ENABLED=true 但缺少 GEMINI_API_KEY，跳过", file=sys.stderr)
+    if not COMMENTARY_KEY:
+        print("[commentary] COMMENTARY_ENABLED=true 但缺少 COMMENTARY_API_KEY，跳过", file=sys.stderr)
         return html_content
 
     items: list[tuple[int, dict, str]] = []  # (matches 中的全局序号, 字段, 原始 news-item HTML)
@@ -372,12 +409,17 @@ def enhance_html_with_comments(html_content: str) -> str:
 
     todo = [(i, it) for i, it, _ in items if cache_keys[i] not in cache]
     cached_count = len(items) - len(todo)
-    if MAX_ITEMS > 0:
+    truncated = 0
+    if MAX_ITEMS > 0 and len(todo) > MAX_ITEMS:
+        truncated = len(todo) - MAX_ITEMS
         todo = todo[:MAX_ITEMS]
+    cap_desc = f"cap={MAX_ITEMS}" if MAX_ITEMS > 0 else "cap=unlimited(评所有抓到的)"
+    trunc_desc = f" truncated={truncated}" if truncated else ""
+    search_desc = "ON(Codex web_search)" if SEARCH else "OFF"
     print(
         f"[commentary] total={len(items)} cached={cached_count} "
-        f"to_query={len(todo)} model={MODEL} thinking={THINKING} "
-        f"search={'on' if SEARCH else 'off'} conc={CONCURRENCY}",
+        f"to_query={len(todo)}{trunc_desc} model={MODEL} thinking={THINKING} "
+        f"search={search_desc} conc={CONCURRENCY} {cap_desc}",
         file=sys.stderr,
     )
 

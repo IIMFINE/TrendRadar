@@ -221,6 +221,16 @@ def generate_html_report(
         # 默认简单 HTML
         html_content = f"<html><body><h1>Report</h1><pre>{report_data}</pre></body></html>"
 
+    # === 评论增强（COMMENTARY_ENABLED=true 时启用） ===
+    # 此处对生成完的 HTML 做后处理：对每条新闻调 Codex 评论员视角，
+    # 把评论注入回 HTML，使 localhost:8090 直接看到带评论版本。
+    # 默认未启用；启用后失败也只降级到原始 HTML，绝不会破坏抓取流程。
+    try:
+        from trendradar.report.comment_enhancer import enhance_html_with_comments
+        html_content = enhance_html_with_comments(html_content)
+    except Exception as e:
+        print(f"[commentary] 增强失败，保留原 HTML: {e}")
+
     # 1. 保存时间戳快照（历史记录）
     with open(snapshot_file, "w", encoding="utf-8") as f:
         f.write(html_content)

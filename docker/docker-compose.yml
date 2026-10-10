@@ -1,6 +1,8 @@
 services:
   trendradar:
-    image: wantcat/trendradar:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: trendradar
     restart: unless-stopped
 
@@ -51,12 +53,24 @@ services:
       - S3_SECRET_ACCESS_KEY=${S3_SECRET_ACCESS_KEY:-}
       - S3_REGION=${S3_REGION:-}
       # 运行模式
-      - CRON_SCHEDULE=${CRON_SCHEDULE:-*/30 * * * *}
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-0 */12 * * *}
       - RUN_MODE=${RUN_MODE:-cron}
       - IMMEDIATE_RUN=${IMMEDIATE_RUN:-true}
+      # === 评论员视角增强（COMMENTARY_ENABLED=true 时启用） ===
+      - COMMENTARY_ENABLED=${COMMENTARY_ENABLED:-false}
+      - COMMENTARY_API_KEY=${COMMENTARY_API_KEY:-}
+      - COMMENTARY_BASE_URL=${COMMENTARY_BASE_URL:-https://api.aicodemirror.ai/api/codex/backend-api/codex/v1}
+      - COMMENTARY_MODEL=${COMMENTARY_MODEL:-gpt-5.6-sol}
+      - COMMENTARY_THINKING=${COMMENTARY_THINKING:-HIGH}
+      - COMMENTARY_SEARCH=${COMMENTARY_SEARCH:-true}
+      - COMMENTARY_MAX_ITEMS=${COMMENTARY_MAX_ITEMS:-0}
+      - COMMENTARY_CONCURRENCY=${COMMENTARY_CONCURRENCY:-4}
+      - COMMENTARY_RETRIES=${COMMENTARY_RETRIES:-3}
 
   trendradar-mcp:
-    image: wantcat/trendradar-mcp:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.mcp
     container_name: trendradar-mcp
     restart: unless-stopped
 

@@ -1,0 +1,14 @@
+# --- /hotspot 管线中间产物（按时间戳归档，不入版本控制） ---
+output/commentary/
+
+# Local Python environments and bytecode
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated reports and crawl data
+/output/
+
+# Local backup files
+*.bak
